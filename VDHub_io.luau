@@ -74,12 +74,12 @@ local tConfig  = tabs:Tab({ Name = "Config", Icon = "sliders" })
 
 -- ============ STATE ============
 local S = {
-    Parry = { Enabled=false, Dist=18, Bind="F", Humanize=0.05, Visual=true },
-    Skill = { Enabled=false, Mode="Perfect", SpeedCap=true, HitWindow=20, Lead=1.5, Debug=true },
-    Moonwalk = { Enabled=false, Mode="Legit", Speed=16 },
-    Dagger = { SpinBack=true, Anim="Parry", Speed=1.5 },
-    Crouch = { Enabled=false, Radius=20, HoldTime=1.2 },
-    VaultMod = { Enabled=false, AnyAngle=true, AnySpeed=true, Finesse=false },
+    Parry = { Enabled=false, Dist=18, Humanize=0.05, Visual=true },
+    Skill = { Enabled=false, Lead=1.5, Debug=true },
+    Moonwalk = { Enabled=false, Mode="Legit" },
+    Dagger = { SpinBack=true, Speed=1.5 },
+    Crouch = { Enabled=false, Radius=20 },
+    VaultMod = { Enabled=false, AnyAngle=true, AnySpeed=true, AlwaysFast=false, Finesse=false },
     -- Tidal ports (strict list)
     FloatMod = { Enabled=false, Method="Part", UpOffset=0, DownOffset=0, Color=Color3.fromRGB(163,162,165), UpSpeed=20, DownSpeed=20, UpKey=Enum.KeyCode.E, DownKey=Enum.KeyCode.Q },
     SpiderMod = { Speed=20, Radius=2.5, MaxAngleDeg=10, Method="Velocity", ResetVel=false },
@@ -91,8 +91,8 @@ local S = {
     Heal = { Auto=false, Range=25 },
     AutoGen = { Enabled=false, Range=30 },
     Dodger = { Enabled=false, Radius=22 },
-    ShootKiller = { Enabled=false, WhileDown=false },
-    KillerTools = { AutoKill=false, AutoCarry=false, AutoHook=false, NoCD=false, AutoBreak=false, IgnoreFlash=false, NoStun=false },
+    ShootKiller = { Enabled=false, WhileDown=false }, -- UI-only: aimbot not ported (external used raw memory)
+    KillerTools = { AutoCarry=false, AutoHook=false, NoCD=false, AutoBreak=false, IgnoreFlash=false, NoStun=false },
     ESP = {
         Master=true, MaxDist=5000,
         Killer={Enabled=false, Name=true, Dist=true, Aura=false, AuraColor=Color3.fromRGB(255,0,0), Tracer=false, TracerColor=Color3.fromRGB(255,0,0)},
@@ -102,28 +102,12 @@ local S = {
         Vault={Enabled=false, Dist=true, Color=Color3.fromRGB(180,140,255), Tracer=false, Cham=false},
         Hook={Enabled=false, Dist=true, Color=Color3.fromRGB(255,0,0), Tracer=false, Cham=false},
         Gate={Enabled=false, Dist=true, Color=Color3.fromRGB(0,255,140), Tracer=false, Cham=false},
-        Locker={Enabled=false, Dist=true, Color=Color3.fromRGB(140,140,140), Cham=false},
+        Locker={Cham=false, Color=Color3.fromRGB(140,140,140)}, -- cham only (no ESP toggle yet)
     },
     Move = { Speed=false, SpeedVal=1.3, Noclip=false, Fly=false, FlySpeed=60, Jump=false, JumpPower=50, Spider=false, Fov=70, FovOn=false },
-    Visual = { Fullbright=false, NoFog=false, AntiAFK=false, AntiFling=false, Freecam=false, FreecamSpeed=100, Freelook=false, CameraPhase=false },
+    Visual = { Fullbright=false, NoFog=false, AntiAFK=false, AntiFling=false, Freecam=false, CameraPhase=false },
     Cursor = { Unlock=true },
-    TeleNoclipPallets = false,
-    -- Tidal-Wave ports (github.com/fluidnarrator30/Tidal-Wave)
-    Tidal = {
-        VaultAnyAngle = true, VaultAnySpeed = true, VaultFinesse = false,
-        NoSlowdown = false, PromptRange = 4,
-        Cape = false, CapeColor = Color3.fromRGB(0, 0, 0),
-        CameraPhase = false, Freelook = false, FreecamEx = false,
-        FreecamSpeed = 50, FreecamShift = 2, FreecamSens = 100,
-        PauseDisabler = false,
-        Float = false, FloatMethod = "Part", FloatUp = 20, FloatDown = 20,
-        Spider = false, SpiderMethod = "Velocity", SpiderSpeed = 20, SpiderRadius = 2.5,
-        SpiderMaxAngle = 10, SpiderResetVel = true,
-        AnimSpeed = false, AnimSpeedVal = 1, AnimMulti = false, AnimMultiVal = 1,
-        Dance = false, DanceR6 = "Dance", DanceR15 = "River Dance",
-        CustomAnim = false, CustomAnimId = "", CustomAnimSpeed = 1,
-        Spasm = false, Stare = false, StareTarget = "", HeadSit = false, HeadSitTarget = "",
-    },
+    TeleNoclipPallets = false, -- UI-only placeholder (feature not implemented)
 }
 
 -- ============ HELPERS (real executor safe) ============
@@ -1380,8 +1364,7 @@ local function setCape(on)
         end),
     }
 end
-local lbConn
-lbConn = Lighting:GetPropertyChangedSignal("Ambient"):Connect(function() end) -- keep ref
+-- Fullbright / NoFog loop below owns Lighting; no stray signal connections.
 RunService.Heartbeat:Connect(function()
     if not alive then return end
     if S.Visual.Fullbright then
@@ -1395,7 +1378,6 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 -- AntiAFK
-UserInputService.WindowFocused:Connect(function() end)
 local afkConn
 local function setAntiAFK(on)
     S.Visual.AntiAFK = on
@@ -1438,17 +1420,18 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
--- Auto Skillcheck: exact server signatures (reverse engineered, no validation)
--- SkillCheckResultEvent: (result, score, generatorModel, generatorPoint)
+-- ============ SKILLCHECK: shared state (hook + grader) ============
+-- SkillCheckResultEvent signatures (reverse engineered):
 --   Perfect -> ("success", 1, gen, point) | Great -> ("neutral", 0, gen, point)
--- RepairEvent: (generatorPoint, false)
--- TIMING: the needle (Line) sweeps, Goal is the zone. Instant answers MISS
--- (miss = fail penalty = rooted sitting), so fire only when aligned.
+-- RepairEvent: (generatorPoint, false). We never fire result remotes ourselves:
+-- the game owns the tuple; we press real Space when the needle is in the zone.
 local skillFiredAt = 0
 local skillWasVisible = false
 local skillShots = 0 -- shots used for the current prompt episode (cap 4, one per revolution)
 local skillCtx = nil -- {gen=Model, point=BasePart} captured from SkillCheckEvent
 local skillGuiCache = nil
+local skillVisSince = nil  -- when the current prompt became visible
+local skillGaveUp = false  -- already released a stuck (>12s) prompt this episode
 local function skillGui()
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     local sc = pg and pg:FindFirstChild("SkillCheckPromptGui")
@@ -1474,11 +1457,6 @@ local function skillGui()
     if not check or not line or not goal then skillGuiCache = nil return nil end
     skillGuiCache = { sc = sc, check = check, line = line, goal = goal }
     return skillGuiCache
-end
-local function angDiff(a, b)
-    local d = (a - b) % 360
-    if d > 180 then d = 360 - d end
-    return d
 end
 local function genPointOf(model, nearPos)
     if not model then return nil end
@@ -1526,21 +1504,7 @@ local function currentRepairTarget(maxDist)
     end
     return best, bestPt
 end
-local function answerSkill(err)
-    -- SPACE approach: the game owns the correct result tuple (gen/point/score),
-    -- so we press the real Space key when the needle is in the zone and let
-    -- the game's own handler answer. Firing SkillCheckResultEvent ourselves
-    -- wiped gen progress without counting, so NEVER fire it here.
-    if skillShots >= 4 then return end
-    if os.clock() - skillFiredAt < 0.25 then return end
-    skillFiredAt = os.clock()
-    skillShots += 1
-    pcall(function() keyclick(32) end) -- VK_SPACE, only while prompt visible
-    if S.Skill.Debug then
-        notify("Skill", ("SPACE err=%.1f shot %d/4"):format(err or -1, skillShots))
-    end
-    print(("[VDHub_io] skill SPACE err=%.1f shot=%d"):format(err or -1, skillShots))
-end
+-- Release the repair channel + unroot the character (stuck prompt / manual button)
 local function unstick()
     local hrp = myHRP()
     local char = LocalPlayer.Character
@@ -1564,6 +1528,9 @@ local function unstick()
     end
     notify("Unstick", "repair released")
 end
+
+-- Context hook: capture the live generator/point from SkillCheckEvent so
+-- autogen targets the exact gen the prompt belongs to. Never answers here.
 local function hookSkillcheck()
     local gen = getRemote("Remotes.Generator.SkillCheckEvent")
     if gen and gen:IsA("RemoteEvent") then
@@ -1581,8 +1548,6 @@ local function hookSkillcheck()
                         end
                     end
                 end
-                if not S.Skill.Enabled then return end
-                -- timing loop answers; hook only captures context
             end)
         end)
     end
@@ -1598,7 +1563,8 @@ local function hookSkillcheck()
     end
 end
 pcall(hookSkillcheck)
--- GUI timing loop on RenderStepped (~60Hz).
+
+-- ============ SKILLCHECK GRADER (RenderStepped ~60Hz) ============
 -- PORTED FROM VD MATCHA (external, naibko-dil): the old internal grader was
 -- fully broken because it read Line.Rotation / Goal.Rotation directly. The
 -- game's tween writes the live angle to an internal GUI field; the exposed
@@ -1789,7 +1755,8 @@ local function setAnimSpeed(on)
     hookHum()
     table.insert(T.animSpdConn, LocalPlayer.CharacterAdded:Connect(function()
         task.wait(0.5)
-        if S.AnimMod.SpeedOn then hookHum() end
+        -- re-hook only while the toggle is still on (SpeedOn lives in the UI callback)
+        if S.AnimMod.SpeedOn and T.animSpdTracks then hookHum() end
     end))
     table.insert(T.animSpdConn, RunService.PreAnimation:Connect(function()
         if not alive or not S.AnimMod.SpeedOn or not T.animSpdTracks then return end
@@ -1935,10 +1902,8 @@ c1:Keybind({ Name = "Parry bind", Default = Enum.KeyCode.F, Callback = function(
 local c2 = tCombat:Section({ Side = "Right" })
 c2:Header({ Name = "Skillcheck", Icon = "check" })
 c2:Toggle({ Name = "Auto Skillcheck", Default = false, Callback = function(v) S.Skill.Enabled = v end }, "SkillEnabled")
-c2:Dropdown({ Name = "Mode", Options = {"Perfect", "Great"}, Default = 1, Callback = function(v) S.Skill.Mode = v end }, "SkillMode")
-c2:Slider({ Name = "Hit window (deg)", Default = 20, Minimum = 3, Maximum = 30, DisplayMethod = "Value", Callback = function(v) S.Skill.HitWindow = v end }, "SkillWindow")
-c2:Slider({ Name = "Lead (deg)", Default = 1.5, Minimum = 0, Maximum = 10, DisplayMethod = "Value", Callback = function(v) S.Skill.Lead = v end }, "SkillLead")
-c2:Toggle({ Name = "Debug (F9 console)", Default = false, Callback = function(v) S.Skill.Debug = v end }, "SkillDebug")
+c2:Slider({ Name = "Lead (deg)", Default = 15, Minimum = 0, Maximum = 100, DisplayMethod = "Value", Callback = function(v) S.Skill.Lead = v / 10 end }, "SkillLead")
+c2:Toggle({ Name = "Debug (console log)", Default = true, Callback = function(v) S.Skill.Debug = v end }, "SkillDebug")
 
 local c3 = tCombat:Section({ Side = "Left" })
 c3:Header({ Name = "Moonwalk / Dagger", Icon = "code" })
@@ -1959,6 +1924,10 @@ c4:Slider({ Name = "Crouch radius", Default = 20, Minimum = 5, Maximum = 60, Cal
 c4:Toggle({ Name = "FastVaultModifier", Default = false, Callback = function(v) S.VaultMod.Enabled = v applyVaultMaster() end }, "FastVault")
 c4:Toggle({ Name = "Any Angle", Default = true, Callback = function(v) S.VaultMod.AnyAngle = v applyVaultMaster() end }, "VaultAnyAngle")
 c4:Toggle({ Name = "Any Speed", Default = true, Callback = function(v) S.VaultMod.AnySpeed = v applyVaultMaster() end }, "VaultAnySpeed")
+c4:Toggle({ Name = "Always Fast Vault (Matcha port)", Default = false, Callback = function(v)
+    S.VaultMod.AlwaysFast = v
+    if not v then pcall(fvRestore) fvStat.status = "Disabled" end
+end }, "VaultAlwaysFast")
 c4:Toggle({ Name = "Finesse Vault (Flowstate)", Default = false, Callback = function(v) S.VaultMod.Finesse = v setFinesse(v) end }, "VaultFinesse")
 c4:Toggle({ Name = "NoSlowdown", Default = false, Callback = function(v) S.NoSlowdown = v end }, "NoSlowdown")
 c4:Toggle({ Name = "Auto Heal", Default = false, Callback = function(v) S.Heal.Auto = v end }, "AutoHeal")
@@ -1983,7 +1952,6 @@ c4:Toggle({ Name = "Shoot While Down", Default = false, Callback = function(v) S
 -- Killer tab
 local k1 = tKiller:Section({ Side = "Left" })
 k1:Header({ Name = "Killer tools", Icon = "eye" })
-k1:Toggle({ Name = "Auto Kill All", Default = false, Callback = function(v) S.KillerTools.AutoKill = v end }, "AutoKill")
 k1:Toggle({ Name = "Auto Carry", Default = false, Callback = function(v) S.KillerTools.AutoCarry = v end }, "AutoCarry")
 k1:Toggle({ Name = "Auto Hook", Default = false, Callback = function(v) S.KillerTools.AutoHook = v end }, "AutoHook")
 k1:Toggle({ Name = "No cooldown", Default = false, Callback = function(v) S.KillerTools.NoCD = v end }, "NoCD")
