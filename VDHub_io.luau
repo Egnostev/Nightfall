@@ -58,7 +58,7 @@ local tConfig  = tabs:Tab({ Name = "Config", Icon = "sliders" })
 -- ============ STATE ============
 local S = {
     Parry = { Enabled=false, Dist=18, Bind="F", Humanize=0.05, Visual=true },
-    Skill = { Enabled=false, Mode="Perfect", SpeedCap=true, HitWindow=20, Debug=true },
+    Skill = { Enabled=false, Mode="Perfect", SpeedCap=true, HitWindow=20, Lead=1.5, Debug=true },
     Moonwalk = { Enabled=false, Mode="Legit", Speed=16 },
     Dagger = { SpinBack=true, Anim="Parry", Speed=1.5 },
     Crouch = { Enabled=false, Radius=20, HoldTime=1.2 },
@@ -549,12 +549,257 @@ local function setVaultSpeed(on)
         T.vault.speedSaved = nil
     end
 end
+-- ---- ALWAYS FAST VAULT (ported from the Matcha external hub, internal port) ----
+-- The current controller calls SurvivorVault.evaluate on recent movement samples,
+-- then sends its chosen tier with the normal vault request. Its old 40-degree yaw
+-- test is no longer the decision point. We relax the approach distance / pace /
+-- direction rules in that module's constants table while enabled. Sprinting,
+-- grounding, movement locks and the game's allowed-speed gate still apply.
+-- External original patched these numbers through raw memory (findgc + applygc);
+-- internally we reach the same live table through Real's GC API
+-- (docs.projectreal.gg: environment/getgc -- tables need includeTables=true)
+-- and write it with debug.setconstant semantics via direct field assignment.
+local FV_ORIGINAL = {
+    DISTANCE = 3, REPEAT_DISTANCE = 3.5, DOT = 0.7071067811865476,
+    MIN_SPEED = 12.5, ARRIVE_GRACE = 0.12,
+}
+-- A vault can sample zero displacement immediately before its windup. A negative
+-- pace threshold accepts that sample and keeps the sampler's distance / MIN_SPEED
+-- history calculation finite (zero would make 0/0).
+local FV_PATCH = { DISTANCE = 0, REPEAT_DISTANCE = 0, DOT = -1, MIN_SPEED = -1 }
+local FV_KEYS = { "DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED" }
+local fvStat = { status = "Disabled", ready = false, holding = false, vaults = 0, fast = 0, scans = 0 }
+local fvCache, fvResolving, fvAttemptedFor = nil, false, nil
+local fvFault, fvCharId, fvLastCount = nil, nil, nil
+
+local function fvSame(a, b)
+    return type(a) == "number" and a == a and type(b) == "number"
+        and math.abs(a - b) <= math.max(1, math.abs(b)) * 0.000001
+end
+
+-- Internal equivalent of the external build's findgc(): returns candidate rows
+-- { key = "DISTANCE", t = <live constants table> }. The live table is captured
+-- (never copied), so writes through row.t[key] patch the module itself.
+local FV_ALL_KEYS = { "DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED", "ARRIVE_GRACE" }
+local function fvFindTables()
+    local candidates, seen = {}, {}
+    local function consider(t)
+        if type(t) ~= "table" or seen[t] then return end
+        for _, k in ipairs(FV_ALL_KEYS) do
+            if type(rawget(t, k)) ~= "number" then return end
+        end
+        seen[t] = true
+        candidates[#candidates + 1] = t
+    end
+    if filtergc then
+        local ok, res = pcall(filtergc, "table", {
+            DISTANCE = "number", REPEAT_DISTANCE = "number", DOT = "number",
+            MIN_SPEED = "number", ARRIVE_GRACE = "number",
+        })
+        if ok and type(res) == "table" then
+            for _, t in ipairs(res) do consider(t) end
+        end
+    end
+    if #candidates == 0 and getgc then
+        -- getgc only returns tables when includeTables is true (per Real docs)
+        local ok, res = pcall(getgc, true)
+        if ok and type(res) == "table" then
+            for _, t in ipairs(res) do consider(t) end
+        end
+    end
+    local rows = {}
+    for _, t in ipairs(candidates) do
+        for _, k in ipairs(FV_ALL_KEYS) do
+            if rawget(t, k) == FV_ORIGINAL[k] then
+                rows[#rows + 1] = { key = k, t = t }
+                break
+            end
+        end
+    end
+    return rows
+end
+
+local function fvBuildCache(rows)
+    if type(rows) ~= "table" or #rows ~= 5 then return nil, "Vault module not uniquely resolved" end
+    local cache = { rows = rows, byKey = {}, originals = {}, written = {}, job = game.JobId }
+    for _, row in ipairs(rows) do
+        local key = row.key
+        if type(row) ~= "table" or type(key) ~= "string" or type(row.t) ~= "table"
+           or not FV_ORIGINAL[key] or cache.byKey[key] then
+            return nil, "Unexpected vault table layout"
+        end
+        cache.byKey[key] = row
+        local value = row.t[key]
+        if not fvSame(value, FV_ORIGINAL[key]) then return nil, "Vault rules differ from this build" end
+        cache.originals[key] = value
+    end
+    for key in pairs(FV_ORIGINAL) do
+        if not cache.byKey[key] then return nil, "Incomplete vault table" end
+    end
+    return cache
+end
+
+local function fvSetKey(cache, key, value)
+    local row = cache.byKey[key]
+    local ok = pcall(function() row.t[key] = value end)
+    if fvSame(row.t[key], value) then
+        cache.written[key] = not fvSame(value, cache.originals[key])
+    end
+    return ok and fvSame(row.t[key], value)
+end
+
+local function fvHasWrites()
+    if fvCache then
+        for _, key in ipairs(FV_KEYS) do if fvCache.written[key] then return true end end
+    end
+    return false
+end
+
+local function fvRestore()
+    if not fvHasWrites() then fvStat.holding = false return true end
+    if fvCache.job ~= game.JobId then
+        -- The old DataModel is gone. Never touch stale tables in a new game.
+        fvCache, T.vault.cacheSeed = nil, nil
+        fvStat.holding, fvStat.ready = false, false
+        return true
+    end
+    if not fvSame(fvCache.byKey.ARRIVE_GRACE.t.ARRIVE_GRACE, fvCache.originals.ARRIVE_GRACE) then
+        return false
+    end
+    local restored = true
+    for _, key in ipairs(FV_KEYS) do
+        if fvCache.written[key] then
+            local current = fvCache.byKey[key].t[key]
+            if fvSame(current, FV_PATCH[key]) then
+                if not fvSetKey(fvCache, key, fvCache.originals[key]) then restored = false end
+            elseif type(current) == "number" then
+                -- The game or another script already replaced our value.
+                fvCache.written[key] = false
+            else
+                restored = false
+            end
+        end
+    end
+    fvStat.holding = fvHasWrites()
+    return restored and not fvStat.holding
+end
+
+local function fvApply()
+    if not fvCache or fvCache.job ~= game.JobId then return false, "Rejoin detected; reload the hub" end
+    if not fvSame(fvCache.byKey.ARRIVE_GRACE.t.ARRIVE_GRACE, fvCache.originals.ARRIVE_GRACE) then
+        return false, "Vault cache needs refreshing"
+    end
+    for _, key in ipairs(FV_KEYS) do
+        local value = fvCache.byKey[key].t[key]
+        if not fvSame(value, fvCache.originals[key])
+           and not (fvCache.written[key] and fvSame(value, FV_PATCH[key])) then
+            return false, "Vault rules changed"
+        end
+    end
+    for _, key in ipairs(FV_KEYS) do
+        if not fvSame(fvCache.byKey[key].t[key], FV_PATCH[key]) then
+            if not fvSetKey(fvCache, key, FV_PATCH[key]) then
+                fvRestore()
+                return false, "Could not apply vault rules"
+            end
+        end
+    end
+    return true
+end
+
+local function fvResolve(characterId)
+    if fvResolving or fvAttemptedFor == characterId then return end
+    fvResolving, fvAttemptedFor = true, characterId
+    fvStat.status = "Resolving vault module"
+    task.spawn(function()
+        task.wait(0.35)
+        if not alive or not S.VaultMod.AlwaysFast then
+            fvResolving, fvAttemptedFor = false, nil
+            return
+        end
+        local ok, cache, err = pcall(function()
+            if T.vault.cacheSeed and T.vault.cacheSeed.job == game.JobId then
+                local reused = fvBuildCache(T.vault.cacheSeed.rows)
+                T.vault.cacheSeed = nil
+                if reused then return reused end
+            end
+            -- A scan happens only on first enable, or after a failed resolve and
+            -- a new character. A healthy cache survives ordinary respawns.
+            fvStat.scans = fvStat.scans + 1
+            return fvBuildCache(fvFindTables())
+        end)
+        fvResolving = false
+        if not alive then return end
+        if ok and cache then
+            fvCache = cache
+            T.vault.cacheSeed = { job = game.JobId, rows = cache.rows }
+            fvStat.ready, fvStat.error = true, nil
+        else
+            fvStat.error = tostring(ok and err or cache)
+            fvStat.status = "Waiting for survivor module"
+        end
+    end)
+end
+
+local function fvObserveVault()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    local id = tostring(ch)
+    if id ~= fvCharId then
+        fvCharId, fvLastCount = id, nil
+        fvStat.tier, fvStat.reason = nil, nil
+    end
+    local count = ch:GetAttribute("__VaultFireCount")
+    local tier, reason = ch:GetAttribute("VaultTier"), ch:GetAttribute("VaultReason")
+    if type(count) == "number" then
+        if fvLastCount and count > fvLastCount then
+            local delta = count - fvLastCount
+            fvStat.vaults = fvStat.vaults + delta
+            if tier == "fast" then fvStat.fast = fvStat.fast + delta end
+        end
+        fvLastCount = count
+    end
+    if type(tier) == "string" then fvStat.tier = tier end
+    if type(reason) == "string" then fvStat.reason = reason end
+    return id
+end
+
+task.spawn(function()
+    while alive do
+        local ok, err = pcall(function()
+            local id = fvObserveVault()
+            if not S.VaultMod.AlwaysFast then
+                local restored = fvRestore()
+                if restored then fvFault = nil end
+                fvStat.status = restored and "Disabled" or "Restore pending: re-enable the toggle"
+            elseif not fvCache then
+                if id then fvResolve(id) else fvStat.status = "Waiting for character" end
+            elseif fvFault then
+                fvStat.status = fvFault
+            else
+                local applied, why = fvApply()
+                fvStat.holding = applied
+                fvStat.status = applied and "Ready - sprint to vault" or why
+                fvStat.error = applied and nil or why
+                if not applied then fvFault = why end
+            end
+        end)
+        if not ok then
+            fvStat.error, fvStat.status = tostring(err), "Retrying after read error"
+        end
+        task.wait(0.2)
+    end
+end)
+
 local function applyVaultMaster()
     local on = S.VaultMod.Enabled
     setVaultAngle(on and S.VaultMod.AnyAngle)
     if not on then setVaultAngle(false) end
     setVaultSpeed(on and S.VaultMod.AnySpeed)
     if not on then setVaultSpeed(false) end
+    if not S.VaultMod.AlwaysFast then
+        pcall(fvRestore)
+    end
 end
 local function setFinesse(on)
     if T.vault.finesseConn then pcall(function() T.vault.finesseConn:Disconnect() end) T.vault.finesseConn = nil end
@@ -1336,17 +1581,83 @@ local function hookSkillcheck()
     end
 end
 pcall(hookSkillcheck)
--- GUI timing loop on RenderStepped (~60Hz): needle does a full revolution in
--- ~1.3s (~280 deg/s), so 10Hz Heartbeat sampling skips a 10deg window entirely.
+-- GUI timing loop on RenderStepped (~60Hz).
+-- PORTED FROM VD MATCHA (external, naibko-dil): the old internal grader was
+-- fully broken because it read Line.Rotation / Goal.Rotation directly. The
+-- game's tween writes the live angle to an internal GUI field; the exposed
+-- Rotation property stays stale at 0 in the current build. Matcha reads the
+-- real values out of memory (offset +0xD8, resolved via a geometry+sin/cos
+-- signature). Internally we cannot touch raw memory, so we read the same
+-- field through the engine itself: debug.getproperty(inst, "Rotation"),
+-- which bypasses the stale public binding. If the engine ever fixes the
+-- public property again, plain .Rotation is used as-is.
 local skillDbgAt = 0
-RunService.RenderStepped:Connect(function()
-    if not alive or not S.Skill.Enabled then skillWasVisible = false skillShots = 0 return end
+local function rotOf(inst)
+    local v = inst.Rotation
+    if type(v) == "Vector2" then v = v.X end
+    if type(v) ~= "number" or v ~= v then v = nil end
+    local ok, dv = pcall(debug.getproperty, inst, "Rotation")
+    if ok and type(dv) == "number" and dv == dv then
+        -- prefer the debug-read value when it disagrees with the stale
+        -- public binding (needle actually moving vs frozen at 0)
+        if not v or math.abs(dv - v) > 0.001 then v = dv end
+    end
+    return v
+end
+-- Separate sampling from input so a reset, chained goal, or held physical key
+-- cannot produce repeated presses. A stationary/hidden needle never arms.
+-- (Matcha scAdvance(): motion-rate lead compensation + server grader window
+--  Goal+102 .. Goal+116 measured clockwise from the goal.)
+local function scAdvance(t, lr, gr, now, lead)
+    local previous = t.line
+    local reset = t.goal == nil or math.abs(gr - t.goal) > 0.5
+        or (previous ~= nil and lr < previous - 2)
+    if reset then
+        t.fired, t.counted, t.missed = false, false, false
+        t.motionAt, t.motionLine, t.rate = nil, nil, nil
+    end
+    local moved = previous ~= nil and lr > previous + 0.001
+    if moved then
+        if t.motionAt then
+            local dt = now - t.motionAt
+            if dt > 0 and dt < 0.5 then
+                local rate = (lr - t.motionLine) / dt
+                if rate > 0 and rate < 10000 then
+                    t.rate = t.rate and (t.rate * 0.5 + rate * 0.5) or rate
+                end
+            end
+        end
+        t.motionAt, t.motionLine = now, lr
+    end
+    t.line, t.goal = lr, gr
+    local active = lr > 0.05 and t.motionAt ~= nil and now - t.motionAt <= 0.12
+    local newCheck = active and not t.counted
+    if newCheck then t.counted = true end
+    local lo, hi = gr + 102, gr + 116
+    local threshold = math.clamp(gr + 109 - math.clamp(lead or 0, 0, 10)
+        - (t.rate or 0) / 120, lo + 0.25, hi - 0.25)
+    local missed = active and not t.fired and not t.missed and lr > hi
+    if missed then t.missed = true end
+    return active and not t.fired and lr >= threshold and lr <= hi, newCheck, missed, lo, hi
+end
+local skillTrack = {}
+local function resetSkillTrack()
+    skillTrack.fired, skillTrack.counted, skillTrack.missed = false, false, false
+    skillTrack.motionAt, skillTrack.motionLine, skillTrack.rate = nil, nil, nil
+    skillTrack.line, skillTrack.goal = nil, nil
+end
+local skillMisses, skillErrors = 0, 0
+trackConn(RunService.RenderStepped:Connect(function(dt)
+    if not alive or not S.Skill.Enabled then
+        skillWasVisible = false skillShots = 0 resetSkillTrack() return
+    end
     local g = skillGui()
     local vis = g and g.check.Visible == true
     if vis and not skillWasVisible then
         skillShots = 0 -- new prompt episode
         skillVisSince = os.clock()
         S.Skill._prevErr = nil
+        resetSkillTrack()
     end
     if vis and g then
         -- prompt stuck open >12s (failed state): release once, don't feed it
@@ -1355,31 +1666,40 @@ RunService.RenderStepped:Connect(function()
             unstick()
             notify("Skill", "prompt stuck >12s, released")
         end
-        local lr, gr = g.line.Rotation, g.goal.Rotation
-        local err = angDiff(lr, gr)
-        S.Skill._err = err
-        if S.Skill.Debug and os.clock() - skillDbgAt > 0.5 then
-            skillDbgAt = os.clock()
-            print(("[VDHub_io] skill R=%.1f G=%.1f err=%.1f shots=%d"):format(lr, gr, err, skillShots))
-        end
-        -- fire ONLY while approaching the zone: on exit (err growing) the
-        -- press would land ~15-25deg past (pipeline delay) = instant miss.
-        -- needle runs ~280deg/s, so entry-side presses land near center.
-        local prev = S.Skill._prevErr
-        local approaching = (prev == nil and err <= (S.Skill.HitWindow or 20) * 0.75)
-            or (prev ~= nil and err < prev - 0.5)
-        S.Skill._prevErr = err
-        -- Mode sets the effective window: Perfect = only near center (greats
-        -- rejected by skipping wide entries), Great = full slider window.
-        local win = (S.Skill.HitWindow or 20)
-        if S.Skill.Mode == "Perfect" then win = math.min(win, 8) end
-        if approaching and err <= win then
-            answerSkill(err)
+        local lr, gr = rotOf(g.line), rotOf(g.goal)
+        if not lr or not gr or lr < -3600 or gr < -3600 then
+            resetSkillTrack() -- layout refresh: needle unreadable this frame
+        else
+            local now = os.clock()
+            local fire, newCheck, missed = scAdvance(skillTrack, lr, gr, now, S.Skill.Lead)
+            S.Skill._err = (lr - gr) % 360 -- clockwise distance from the goal
+            S.Skill._needle, S.Skill._goal = lr, gr
+            if S.Skill.Debug and now - skillDbgAt > 0.5 then
+                skillDbgAt = now
+                print(("[VDHub_io] skill L=%.1f G=%.1f rel=%.1f rate=%.0f shots=%d")
+                    :format(lr, gr, S.Skill._err, skillTrack.rate or 0, skillShots))
+            end
+            if newCheck then S.Skill._checks = (S.Skill._checks or 0) + 1 end
+            if missed then
+                skillMisses += 1
+                S.Skill._misses = skillMisses
+            end
+            if fire then
+                if skillShots >= 4 then return end -- cap 4, one per revolution
+                skillTrack.fired = true
+                skillShots += 1
+                skillFiredAt = now
+                pcall(function() keyclick(32) end) -- VK_SPACE, only while prompt visible
+                if S.Skill.Debug then
+                    print(("[VDHub_io] skill SPACE fired rel=%.1f shot=%d/4")
+                        :format(S.Skill._err, skillShots))
+                end
+            end
         end
     end
-    if not vis then skillShots = 0 skillVisSince = nil skillGaveUp = false S.Skill._prevErr = nil end
+    if not vis then skillShots = 0 skillVisSince = nil skillGaveUp = false S.Skill._prevErr = nil resetSkillTrack() end
     skillWasVisible = vis and true or false
-end)
+end))
 
 -- ---- Animations (Tidal): R6-friendly tracks + target movers ----
 T.animReg = {}
@@ -1600,6 +1920,7 @@ c2:Header({ Name = "Skillcheck", Icon = "check" })
 c2:Toggle({ Name = "Auto Skillcheck", Default = false, Callback = function(v) S.Skill.Enabled = v end }, "SkillEnabled")
 c2:Dropdown({ Name = "Mode", Options = {"Perfect", "Great"}, Default = 1, Callback = function(v) S.Skill.Mode = v end }, "SkillMode")
 c2:Slider({ Name = "Hit window (deg)", Default = 20, Minimum = 3, Maximum = 30, DisplayMethod = "Value", Callback = function(v) S.Skill.HitWindow = v end }, "SkillWindow")
+c2:Slider({ Name = "Lead (deg)", Default = 1.5, Minimum = 0, Maximum = 10, DisplayMethod = "Value", Callback = function(v) S.Skill.Lead = v end }, "SkillLead")
 c2:Toggle({ Name = "Debug (F9 console)", Default = false, Callback = function(v) S.Skill.Debug = v end }, "SkillDebug")
 
 local c3 = tCombat:Section({ Side = "Left" })
