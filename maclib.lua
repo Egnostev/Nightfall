@@ -639,30 +639,6 @@ end)
 
 MacLib._screen = screen
 
--- Use the regular system cursor instead of a custom in-game one. Some executors and
--- older Roblox builds hide or replace the OS pointer while a ScreenGui is up; this
--- block restores the native cursor on load (and keeps it restored every frame), so
--- there is no fake arrow following the mouse anymore.
-local function restoreSystemCursor()
-	pcall(function()
-		UIS.MouseIconEnabled = true
-	end)
-	pcall(function()
-		if sethiddenproperty then
-			sethiddenproperty(CoreGui, "SimulationStates", { MouseIconBehavior = Enum.MouseIconBehavior.ShowAlways })
-		end
-	end)
-	pcall(function()
-		local legacy = require(19) -- ReplicatedStorage: Legacy
-		if legacy and legacy.UserInput then
-			legacy.UserInput.SetMouseState = function() end -- never override the system cursor
-		end
-	end)
-end
-MacLib.RestoreSystemCursor = restoreSystemCursor
-restoreSystemCursor()
-RunService.RenderStepped:Connect(restoreSystemCursor)
-
 theme = {
 	accent = C.accent,
 	blur = true,
