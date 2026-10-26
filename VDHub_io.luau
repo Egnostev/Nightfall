@@ -1,9 +1,8 @@
 --[[
     Violence District Hub v3 | io-lib (MacLib fork) edition
     gitbook: io-lib | real executor
-    Loader (Real workspace):
-        loadstring(readfile("VDHub_io.luau"))()
-    Requires: Workspace/maclib.lua (already present, 143534 bytes)
+    Loader (one line, loads maclib from GitHub):
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Egnostev/Nightfall/main/VDHub_io.luau", true))()
 ]]
 
 local Players = game:GetService("Players")
@@ -26,7 +25,25 @@ end
 local alive = true
 
 -- ============ io-lib load (per gitbook getting-started) ============
-local MacLib = loadstring(readfile("maclib.lua"))()
+-- Maclib is fetched from GitHub; local readfile("maclib.lua") kept as fallback.
+local MACLIB_URL = "https://raw.githubusercontent.com/Egnostev/Nightfall/main/maclib.lua"
+local function fetchMacLib()
+    -- 1) fresh download from GitHub (noCache)
+    local ok, src = pcall(function() return game:HttpGet(MACLIB_URL, true) end)
+    if ok and type(src) == "string" and #src > 1000 then
+        pcall(writefile, "maclib.lua", src) -- cache locally for offline/fallback
+        local lib = loadstring(src)()
+        if lib then return lib end
+    end
+    -- 2) previously cached local copy
+    local ok2, localSrc = pcall(readfile, "maclib.lua")
+    if ok2 and type(localSrc) == "string" and #localSrc > 1000 then
+        local lib = loadstring(localSrc)()
+        if lib then return lib end
+    end
+    error("[VDHub_io] failed to load maclib.lua from GitHub or local cache")
+end
+local MacLib = fetchMacLib()
 MacLib:SetFolder("VDHub_io")
 
 local Window = MacLib:Window({
