@@ -88,13 +88,12 @@ local S = {
     AnimMod = { Speed=1, UseMulti=false, Multi=1, DanceR6="Dance", DanceR15="River Dance",
         BangSpeed=1, HeadThrowSpeed=1, JerkSpeed=1, OrbitSpeed=45, OrbitDist=5 },
     NoSlowdown = false,
-    Heal = { Auto=false, Range=25 },
-    AutoGen = { Enabled=false, Range=30 },
+    Heal = { Auto=false },
+    AutoGen = { Enabled=false },
     Dodger = { Enabled=false, Radius=22 },
-    ShootKiller = { Enabled=false, WhileDown=false }, -- UI-only: aimbot not ported (external used raw memory)
-    KillerTools = { AutoCarry=false, AutoHook=false, NoCD=false, AutoBreak=false, IgnoreFlash=false, NoStun=false },
+    KillerTools = { NoCD=false, AutoBreak=false, IgnoreFlash=false, NoStun=false }, -- AutoCarry/AutoHook removed: never read by any loop (dead state)
     ESP = {
-        Master=true, MaxDist=5000,
+        MaxDist=5000,
         Killer={Enabled=false, Name=true, Dist=true, Aura=false, AuraColor=Color3.fromRGB(255,0,0), Tracer=false, TracerColor=Color3.fromRGB(255,0,0)},
         Survivor={Enabled=false, Name=true, Dist=true, Status=true, Aura=false, AuraColor=Color3.fromRGB(0,255,0), Tracer=false, TracerColor=Color3.fromRGB(0,255,0)},
         Generator={Enabled=false, Dist=true, Color=Color3.fromRGB(255,200,0), Tracer=false, Cham=false},
@@ -252,13 +251,14 @@ local function mk(key, cls, props)
 end
 
 -- ============ ESP RENDER (single loop, no ghost boxes) ============
+-- Auras are handled here too (they are an ESP visual). The old dead
+-- `if not S.ESP.Master then return end` gate was removed: nothing ever set
+-- Master to false, but it short-circuited the whole loop, so every ESP
+-- toggle (players, auras, tracers, object labels) silently did nothing.
 RunService:BindToRenderStep("VDHubIO_ESP", Enum.RenderPriority.Last.Value, function()
     if not alive then return end
     local my = myHRP()
     if not my then return end
-    if not S.ESP.Master then
-        return
-    end
     local camPos = Camera.CFrame.Position
 
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -277,7 +277,12 @@ RunService:BindToRenderStep("VDHubIO_ESP", Enum.RenderPriority.Last.Value, funct
         if not hrp or not hum or hum.Health <= 0 then continue end
         local killer = isKiller(plr)
         local cfg = killer and S.ESP.Killer or S.ESP.Survivor
-        if not cfg.Enabled then continue end
+        if not cfg.Enabled then
+            -- tracer lives inside the Enabled branch below; make sure a
+            -- turned-off ESP never leaves its line behind
+            clearPool(key)
+            continue
+        end
         local d = (hrp.Position - camPos).Magnitude
         if d > S.ESP.MaxDist then continue end
         local sp, on = w2v(hrp.Position)
@@ -926,7 +931,8 @@ RunService.Heartbeat:Connect(function()
             if S._genPauseUntil and now < S._genPauseUntil then
                 -- holding release, do nothing
             elseif not moving then
-                local _, pt = currentRepairTarget(S.AutoGen.Range)
+                local _, pt = currentRepairTarget(30) -- fixed 30-stud scan cap;
+                -- hard 12-stud repair limit is enforced inside currentRepairTarget
                 -- stop firing at finished/dead generators (progress attr or gone model)
                 local done = false
                 if pt then
@@ -1889,6 +1895,10 @@ local function firePrompt(prompt)
 end
 
 -- ============ UI BUILD (io-lib API per gitbook) ============
+-- Bind policy: the ONLY default keybind is RightShift (window open/close, set
+-- in MacLib:Window above). Every feature Keybind below starts unbound ("None")
+-- and is bound by the user on demand; maclib's Keybind fires Callback only
+-- when a bind exists, so unbound rows are harmless placeholders.
 
 -- Combat tab
 local c1 = tCombat:Section({ Side = "Left" })
@@ -1897,25 +1907,31 @@ c1:Toggle({ Name = "Enabled", Default = false, Callback = function(v) S.Parry.En
 c1:Slider({ Name = "Distance", Default = 18, Minimum = 5, Maximum = 40, DisplayMethod = "Value", Callback = function(v) S.Parry.Dist = v end }, "ParryDist")
 c1:Slider({ Name = "Humanize delay", Default = 5, Minimum = 0, Maximum = 30, DisplayMethod = "Value", Callback = function(v) S.Parry.Humanize = v / 100 end }, "ParryHumanize")
 c1:Toggle({ Name = "Visual notify", Default = true, Callback = function(v) S.Parry.Visual = v end }, "ParryVisual")
-c1:Keybind({ Name = "Parry bind", Default = Enum.KeyCode.F, Callback = function() fireRemote("Remotes.Items.Parrying Dagger.parry") end }, "ParryBind")
+c1:Keybind({ Name = "Parry bind", Callback = function() fireRemote("Remotes.Items.Parrying Dagger.parry") end }, "ParryBind")
 
 local c2 = tCombat:Section({ Side = "Right" })
 c2:Header({ Name = "Skillcheck", Icon = "check" })
 c2:Toggle({ Name = "Auto Skillcheck", Default = false, Callback = function(v) S.Skill.Enabled = v end }, "SkillEnabled")
 c2:Slider({ Name = "Lead (deg)", Default = 15, Minimum = 0, Maximum = 100, DisplayMethod = "Value", Callback = function(v) S.Skill.Lead = v / 10 end }, "SkillLead")
 c2:Toggle({ Name = "Debug (console log)", Default = true, Callback = function(v) S.Skill.Debug = v end }, "SkillDebug")
+c2:Keybind({ Name = "Skillcheck bind", Callback = function() S.Skill.Enabled = not S.Skill.Enabled end }, "SkillBind")
 
 local c3 = tCombat:Section({ Side = "Left" })
 c3:Header({ Name = "Moonwalk / Dagger", Icon = "code" })
 c3:Toggle({ Name = "Auto Moonwalk", Default = false, Callback = function(v) S.Moonwalk.Enabled = v end }, "Moonwalk")
 c3:Dropdown({ Name = "Method", Options = {"Legit", "Rage", "Reverse"}, Default = 1, Callback = function(v) S.Moonwalk.Mode = v end }, "MoonwalkMode")
 c3:Toggle({ Name = "Spin back on dagger", Default = true, Callback = function(v) S.Dagger.SpinBack = v end }, "DaggerSpin")
-c3:Slider({ Name = "Dagger anim speed", Default = 15, Minimum = 5, Maximum = 40, DisplayMethod = "Value", Callback = function(v) S.Dagger.Speed = v / 10 end }, "DaggerSpeed")
+-- "Dagger anim speed" slider removed: nothing reads S.Dagger.Speed (dead UI).
 c3:Button({ Name = "Use dagger (spin back)", Icon = "bolt", Callback = function()
     local hrp = myHRP()
     if hrp and S.Dagger.SpinBack then hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(180), 0) end
     notify("Dagger", "used, back turned")
 end })
+c3:Keybind({ Name = "Dagger bind", Callback = function()
+    local hrp = myHRP()
+    if hrp and S.Dagger.SpinBack then hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(180), 0) end
+    notify("Dagger", "used, back turned")
+end }, "DaggerBind")
 
 local c4 = tCombat:Section({ Side = "Right" })
 c4:Header({ Name = "Crouch / Vault", Icon = "eye" })
@@ -1929,11 +1945,12 @@ c4:Toggle({ Name = "Always Fast Vault (Matcha port)", Default = false, Callback 
     if not v then pcall(fvRestore) fvStat.status = "Disabled" end
 end }, "VaultAlwaysFast")
 c4:Toggle({ Name = "Finesse Vault (Flowstate)", Default = false, Callback = function(v) S.VaultMod.Finesse = v setFinesse(v) end }, "VaultFinesse")
-c4:Toggle({ Name = "NoSlowdown", Default = false, Callback = function(v) S.NoSlowdown = v end }, "NoSlowdown")
-c4:Toggle({ Name = "Auto Heal", Default = false, Callback = function(v) S.Heal.Auto = v end }, "AutoHeal")
-c4:Button({ Name = "Unstick (release repair)", Icon = "bolt", Callback = function() unstick() end })
-c4:Keybind({ Name = "Unstick bind", Default = Enum.KeyCode.X, Callback = function() unstick() end }, "UnstickBind")
-c4:Toggle({ Name = "Auto Complete Gens", Default = false, Callback = function(v)
+
+local c5 = tCombat:Section({ Side = "Left" })
+c5:Header({ Name = "Survival", Icon = "heart" })
+c5:Toggle({ Name = "NoSlowdown", Default = false, Callback = function(v) S.NoSlowdown = v end }, "NoSlowdown")
+c5:Toggle({ Name = "Auto Heal", Default = false, Callback = function(v) S.Heal.Auto = v end }, "AutoHeal")
+c5:Toggle({ Name = "Auto Complete Gens", Default = false, Callback = function(v)
     S.AutoGen.Enabled = v
     if not v then
         -- release the repair channel so the character is never left rooted
@@ -1944,10 +1961,10 @@ c4:Toggle({ Name = "Auto Complete Gens", Default = false, Callback = function(v)
         S._lastRepairPt = nil
     end
 end }, "AutoGen")
-c4:Toggle({ Name = "Dodger (avoid killer)", Default = false, Callback = function(v) S.Dodger.Enabled = v end }, "Dodger")
-c4:Slider({ Name = "Dodger radius", Default = 22, Minimum = 8, Maximum = 50, Callback = function(v) S.Dodger.Radius = v end }, "DodgerRadius")
-c4:Toggle({ Name = "Auto Shoot Killer", Default = false, Callback = function(v) S.ShootKiller.Enabled = v end }, "ShootKiller")
-c4:Toggle({ Name = "Shoot While Down", Default = false, Callback = function(v) S.ShootKiller.WhileDown = v end }, "ShootDown")
+c5:Button({ Name = "Unstick (release repair)", Icon = "bolt", Callback = function() unstick() end })
+c5:Keybind({ Name = "Unstick bind", Callback = function() unstick() end }, "UnstickBind")
+c5:Toggle({ Name = "Dodger (avoid killer)", Default = false, Callback = function(v) S.Dodger.Enabled = v end }, "Dodger")
+c5:Slider({ Name = "Dodger radius", Default = 22, Minimum = 8, Maximum = 50, Callback = function(v) S.Dodger.Radius = v end }, "DodgerRadius")
 
 -- Killer tab
 local k1 = tKiller:Section({ Side = "Left" })
@@ -1961,13 +1978,22 @@ k1:Toggle({ Name = "Ignore Flashlight", Default = false, Callback = function(v)
     if v then fireRemote("Remotes.Items.Flashlight.GotBlinded", false) end
 end }, "IgnoreFlash")
 k1:Toggle({ Name = "No Stun (killer)", Default = false, Callback = function(v) S.KillerTools.NoStun = v end }, "KillerNoStun")
+-- AutoCarry / AutoHook toggles removed: the state fields exist but no loop
+-- ever reads them (dead UI). The manual buttons below actually work.
 k1:Button({ Name = "Break nearest pallet", Icon = "bolt", Callback = function()
     local my = myHRP()
     if my then fireRemote("Remotes.Pallet.Jason.Destroy", my) end
 end })
+k1:Keybind({ Name = "Break pallet bind", Callback = function()
+    local my = myHRP()
+    if my then fireRemote("Remotes.Pallet.Jason.Destroy", my) end
+end }, "BreakPalletBind")
 k1:Button({ Name = "Hook carried (nearest)", Icon = "bolt", Callback = function()
     fireRemote("Remotes.Carry.HookEvent", myHRP())
 end })
+k1:Keybind({ Name = "Hook bind", Callback = function()
+    fireRemote("Remotes.Carry.HookEvent", myHRP())
+end }, "HookBind")
 
 -- ESP tab
 local e1 = tESP:Section({ Side = "Left" })
@@ -1993,6 +2019,9 @@ e2:Toggle({ Name = "Hook", Default = false, Callback = function(v) S.ESP.Hook.En
 e2:Toggle({ Name = "Hook Cham", Default = false, Callback = function(v) S.ESP.Hook.Cham = v end }, "ESPHookCham")
 e2:Toggle({ Name = "Gate", Default = false, Callback = function(v) S.ESP.Gate.Enabled = v end }, "ESPGate")
 e2:Toggle({ Name = "Gate Cham", Default = false, Callback = function(v) S.ESP.Gate.Cham = v end }, "ESPGateCham")
+-- Locker cham toggle: the chams loop matches "Locker" models; without this row
+-- S.ESP.Locker.Cham was unreachable dead state. Color uses the locker default.
+e2:Toggle({ Name = "Locker Cham", Default = false, Callback = function(v) S.ESP.Locker.Cham = v end }, "ESPLockerCham")
 e2:Slider({ Name = "Max distance", Default = 5000, Minimum = 200, Maximum = 10000, Callback = function(v) S.ESP.MaxDist = v end }, "ESPMaxDist")
 
 -- Move tab
@@ -2001,7 +2030,8 @@ m1:Header({ Name = "Movement", Icon = "code" })
 m1:Toggle({ Name = "Speed", Default = false, Callback = function(v) S.Move.Speed = v end }, "Speed")
 m1:Slider({ Name = "Speed mult", Default = 130, Minimum = 100, Maximum = 300, Callback = function(v) S.Move.SpeedVal = v / 100 end }, "SpeedVal")
 m1:Toggle({ Name = "Noclip", Default = false, Callback = function(v) S.Move.Noclip = v end }, "Noclip")
-m1:Keybind({ Name = "Noclip bind", Default = Enum.KeyCode.N, Callback = function() S.Move.Noclip = not S.Move.Noclip end }, "NoclipBind")
+-- Bind policy: no default key (RightShift window bind is the only exception)
+m1:Keybind({ Name = "Noclip bind", Callback = function() S.Move.Noclip = not S.Move.Noclip end }, "NoclipBind")
 m1:Toggle({ Name = "Fly", Default = false, Callback = function(v) setFly(v) end }, "Fly")
 m1:Slider({ Name = "Fly speed", Default = 60, Minimum = 10, Maximum = 250, Callback = function(v) S.Move.FlySpeed = v end }, "FlySpeed")
 m1:Toggle({ Name = "Legit Jump", Default = false, Callback = function(v) S.Move.Jump = v end }, "JumpMod")
@@ -2012,7 +2042,9 @@ m1:Slider({ Name = "Spider radius", Default = 25, Minimum = 10, Maximum = 90, Ca
 m1:Slider({ Name = "Spider max angle", Default = 10, Minimum = 0, Maximum = 90, Callback = function(v) S.SpiderMod.MaxAngleDeg = v end }, "SpiderAngle")
 m1:Dropdown({ Name = "Spider method", Options = {"Velocity", "CFrame"}, Default = 1, Callback = function(v) S.SpiderMod.Method = v end }, "SpiderMethod")
 m1:Toggle({ Name = "Spider reset vel", Default = false, Callback = function(v) S.SpiderMod.ResetVel = v end }, "SpiderResetVel")
-m1:Toggle({ Name = "Noclip pallets", Default = false, Callback = function(v) S.TeleNoclipPallets = v end }, "NoclipPallets")
+-- "Noclip pallets" toggle removed: UI-only placeholder (TeleNoclipPallets was
+-- never read by any noclip implementation).
+m1:Keybind({ Name = "Fly bind", Callback = function() setFly(not S.Move.Fly) end }, "FlyBind")
 
 local mF = tMove:Section({ Side = "Right" })
 mF:Header({ Name = "Float", Icon = "code" })
@@ -2023,8 +2055,8 @@ mF:Slider({ Name = "Down offset", Default = 0, Minimum = 0, Maximum = 100, Callb
 mF:Slider({ Name = "Up speed", Default = 20, Minimum = 1, Maximum = 100, Callback = function(v) S.FloatMod.UpSpeed = v end }, "FloatUpSpeed")
 mF:Slider({ Name = "Down speed", Default = 20, Minimum = 1, Maximum = 100, Callback = function(v) S.FloatMod.DownSpeed = v end }, "FloatDownSpeed")
 mF:Colorpicker({ Name = "Float color", Default = Color3.fromRGB(163,162,165), Callback = function(c) S.FloatMod.Color = c end }, "FloatColor")
-mF:Keybind({ Name = "Float up", Default = Enum.KeyCode.E, onBinded = function(b) S.FloatMod.UpKey = b end }, "FloatUp")
-mF:Keybind({ Name = "Float down", Default = Enum.KeyCode.Q, onBinded = function(b) S.FloatMod.DownKey = b end }, "FloatDown")
+mF:Keybind({ Name = "Float up", onBinded = function(b) S.FloatMod.UpKey = b end }, "FloatUp")
+mF:Keybind({ Name = "Float down", onBinded = function(b) S.FloatMod.DownKey = b end }, "FloatDown")
 
 local m2 = tMove:Section({ Side = "Right" })
 m2:Header({ Name = "Camera", Icon = "sun" })
