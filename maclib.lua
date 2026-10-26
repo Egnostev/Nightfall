@@ -187,6 +187,16 @@ local function list(parent, dir, gap, align)
 	})
 end
 
+-- keep a floating menu inside the viewport so it never spills off-screen
+local function clampToScreen(inst, pad)
+	pad = pad or 6
+	local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+	local pos = inst.Position
+	local x = math.clamp(pos.X.Offset, pad, math.max(pad, vp.X - inst.AbsoluteSize.X - pad))
+	local y = math.clamp(pos.Y.Offset, pad, math.max(pad, vp.Y - inst.AbsoluteSize.Y - pad))
+	inst.Position = UDim2.fromOffset(math.floor(x + 0.5), math.floor(y + 0.5))
+end
+
 local theme
 
 -- Roblox resamples every border and glyph that lands on a half pixel, which reads
@@ -3581,12 +3591,19 @@ function MacLib:Window(opts)
 					})
 					corner(chip, 6)
 
-					local menu = new("Frame", {
-						Size = UDim2.fromOffset(210, 0),
-						AutomaticSize = Enum.AutomaticSize.Y,
+					local MENU_MAX_H = 240
+					local menu = new("ScrollingFrame", {
+						Size = UDim2.fromOffset(210, MENU_MAX_H),
 						BackgroundColor3 = Color3.fromRGB(36, 36, 38),
 						Visible = false,
 						ZIndex = 30,
+						ScrollBarThickness = 4,
+						ScrollBarImageColor3 = C.separator,
+						ScrollingDirection = Enum.ScrollingDirection.Y,
+						ScrollingEnabled = true,
+						AutomaticCanvasSize = Enum.AutomaticSize.Y,
+						CanvasSize = UDim2.new(0, 0, 0, 0),
+						BorderSizePixel = 0,
 						Parent = screen,
 					})
 					corner(menu, 10)
@@ -3600,6 +3617,7 @@ function MacLib:Window(opts)
 						Parent = menu,
 					})
 					list(menuList, Enum.FillDirection.Vertical, 1)
+					menu.CanvasPosition = Vector2.new(0, 0)
 
 					local searchRow
 					local searchInput
@@ -3717,6 +3735,8 @@ function MacLib:Window(opts)
 							end
 						end
 					end
+					menu.Size = UDim2.fromOffset(210, math.min(MENU_MAX_H, menuList.AbsoluteSize.Y + 8))
+					clampToScreen(menu)
 					if searchInput then
 						searchInput:GetPropertyChangedSignal("Text"):Connect(rebuild)
 					end
@@ -3726,9 +3746,20 @@ function MacLib:Window(opts)
 							return
 						end
 						openPopover(menu)
+						rebuild()
 						local topLeft = chip.AbsolutePosition + Vector2.new(chip.AbsoluteSize.X - 210, chip.AbsoluteSize.Y + 6)
 						menu.Position = UDim2.fromOffset(math.floor(topLeft.X + 0.5), math.floor(topLeft.Y + 0.5))
-						rebuild()
+						-- bring the current selection into view
+						if not multi then
+							for _, r in ipairs(el._rows) do
+								if r.BackgroundTransparency < 1 then
+									local y = r.AbsolutePosition.Y - menu.AbsolutePosition.Y + menu.CanvasPosition.Y - menu.AbsoluteSize.Y / 2
+									menu.CanvasPosition = Vector2.new(0, math.max(0, y))
+									break
+								end
+							end
+						end
+						clampToScreen(menu)
 					end)
 					paint()
 
