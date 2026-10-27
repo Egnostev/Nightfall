@@ -2282,26 +2282,40 @@ end })
 -- Misc tab
 local mi = tMisc:Section({ Side = "Left" })
 mi:Header({ Name = "Misc", Icon = "sliders" })
+local lastAvatarId = 0 -- запоминаем применённый userid для корректного reset
 mi:Input({ Name = "Avatar userid", Placeholder = "12345", Callback = function() end }, "AvatarID")
 mi:Button({ Name = "Avatar by userid", Icon = "user", Callback = function()
-    local id = 0
-    pcall(function() id = tonumber(MacLib.Flags.AvatarID:GetInput()) or 0 end)
-    if id > 0 then
-        pcall(function()
-            local hum = humOf(LocalPlayer.Character)
-            if hum then
-                local desc = Players:GetHumanoidDescriptionFromUserId(id)
-                hum:ApplyDescription(desc)
-            end
-        end)
+    local raw = ""
+    local flag = MacLib.Flags and MacLib.Flags.AvatarID
+    pcall(function() if flag and flag.GetInput then raw = tostring(flag:GetInput()) end end)
+    if raw == "" then raw = tostring(S.Config and S.Config.AvatarID or "") end
+    local id = tonumber((raw:gsub("%D", ""))) or 0
+    if id <= 0 then notify("Avatar", "enter a valid userid first", "error"); return end
+    -- сетевой вызов выносим за pcall-обёртку так, чтобы ошибку было видно;
+    -- на Real GetHumanoidDescriptionFromUserId работает только из unsandboxed контекста
+    local ok, descOrErr = pcall(function() return Players:GetHumanoidDescriptionFromUserId(id) end)
+    if not ok or descOrErr == nil then
+        notify("Avatar", "userid " .. id .. " not found / fetch blocked", "error"); return
+    end
+    local char = LocalPlayer.Character
+    local hum = humOf(char)
+    if not hum then notify("Avatar", "no character / respawn first", "error"); return end
+    local ok2, err2 = pcall(function() hum:ApplyDescription(descOrErr) end)
+    if ok2 then
+        lastAvatarId = id
         notify("Avatar", "applied " .. id)
+    else
+        notify("Avatar", "apply failed: " .. tostring(err2), "error")
     end
 end })
 mi:Button({ Name = "Reset avatar", Icon = "cross", Callback = function()
-    pcall(function()
-        local hum = humOf(LocalPlayer.Character)
-        if hum then hum:ApplyDescription(Players:GetHumanoidDescriptionFromUserId(LocalPlayer.UserId)) end
-    end)
+    -- всегда восстанавливаем РОДНОЙ аватар игрока (LocalPlayer.UserId), а не последний uid
+    local hum = humOf(LocalPlayer.Character)
+    if not hum then notify("Avatar", "no character / respawn first", "error"); return end
+    local ok, descOrErr = pcall(function() return Players:GetHumanoidDescriptionFromUserId(LocalPlayer.UserId) end)
+    if not ok or descOrErr == nil then notify("Avatar", "native description fetch failed", "error"); return end
+    local ok2 = pcall(function() hum:ApplyDescription(descOrErr) end)
+    if ok2 then lastAvatarId = 0; notify("Avatar", "reset to native") else notify("Avatar", "reset failed", "error") end
 end })
 mi:Button({ Name = "Flinger (spin fling)", Icon = "bolt", Callback = function()
     local hrp = myHRP()
