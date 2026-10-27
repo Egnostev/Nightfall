@@ -76,7 +76,7 @@ local tConfig  = tabs:Tab({ Name = "Config", Icon = "sliders" })
 local S = {
     Parry = { Enabled=false, Dist=18, Humanize=0.05, Visual=true },
     Skill = { Enabled=false, Lead=1.5, Debug=true },
-    Moonwalk = { Enabled=false, Mode="Legit" },
+    Moonwalk = { Enabled=false, Mode="Classic", Smooth=16 },
     Dagger = { SpinBack=true, Speed=1.5 },
     Crouch = { Enabled=false, Radius=20 },
     VaultMod = { Enabled=false, AnyAngle=true, AnySpeed=true, AlwaysFast=false, Finesse=false },
@@ -449,42 +449,154 @@ RunService.RenderStepped:Connect(function()
     end
 end)
 
--- ============ MOONWALK: face one way, move the other (rotation only, never position) ============
--- Legit: HRP faces camera-forward while you move any direction (classic backward glide).
--- Reverse: control inversion (W walks you backward, facing stays natural).
--- Rage: fast spin-glitch while moving so facing is unreadable.
-RunService:BindToRenderStep("VDHubIO_Moonwalk", Enum.RenderPriority.Camera.Value + 1, function()
-    if not alive then return end
-    if not S.Moonwalk.Enabled then return end
+-- ============ MOONWALK (rewritten): walk backward while facing forward ============
+-- Why the old version failed in-game: it wrote hrp.CFrame directly on RenderStepped,
+-- which fights the physics stepper and the game's own animation/motor60 system —
+-- the character rubber-bands or snaps back to MoveDirection. This rewrite drives the
+-- rotation through Humanoid.TwistC0 (the supported neck/torso twist channel that
+-- Roblox's Animator blends with locomotion anims), so movement physics are untouched.
+-- Modes: Classic (face camera, moonwalk any direction), Invert (W/S swapped),
+-- Spin (continuous readable-only-to-you rotation). Position is NEVER modified.
+local MW = { hookOK = nil, lastYaw = nil, restored = true }
+
+local function mwGetController()
+    local ok, pm = pcall(function()
+        return require(LocalPlayer:FindFirstChildOfClass("PlayerScripts"):FindFirstChild("PlayerModule"))
+    end)
+    if not ok or type(pm) ~= "table" then return nil end
+    local ctrl
+    pcall(function() ctrl = pm:GetControls() end)
+    if ctrl and typeof(ctrl) == "Instance" then return ctrl end
+    return nil
+end
+
+-- One-time hook: force controller ResetVAE off so our TwistC0 isn't overwritten by VAE.
+local function mwEnsureHook()
+    if MW.hookOK ~= nil then return MW.hookOK end
+    MW.hookOK = false
+    local ctrl = mwGetController()
+    if not ctrl then return false end
+    pcall(function()
+        if debug.getproperty(ctrl, "ResetVAE") then
+            debug.setproperty(ctrl, "ResetVAE", false)
+        end
+    end)
+    MW.hookOK = true
+    return true
+end
+
+local function mwRestore()
+    if MW.restored and not MW.hookOK then return end
+    MW.restored = true
+    MW.lastYaw = nil
     local char = LocalPlayer.Character
-    local hum = humOf(char)
-    local hrp = hrpOf(char)
-    if not hum or not hrp then return end
-    if S.Moonwalk.Mode == "Reverse" then
-        if not S._reversed then
-            S._reversed = true
+    local hum = char and humOf(char)
+    if hum then
+        pcall(function() hum.AutoRotate = true end)
+        local torso = char:FindFirstChild("Torso")
+        local neck = char:FindFirstChild("Neck")
+        if torso and neck and neck:IsA("Motor6D") then
+            pcall(function() torso.C0 = CFrame.new() end)
+        end
+        -- R15: reset waist/pelvis twist channels we may have touched
+        for _, j in ipairs({ "RootJoint", "LowerTorso" }) do
+            local part = char:FindFirstChild(j)
+            if part and part:IsA("Motor6D") then pcall(function() part.C0 = CFrame.new() end) end
+        end
+    end
+    -- restore inverted move function if active
+    if MW.inverted then
+        MW.inverted = false
+        local ctrl = mwGetController()
+        if ctrl then
             pcall(function()
-                local pm = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
-                local ctrl = pm:GetControls()
-                local baseMove = LocalPlayer.Move
-                ctrl.moveFunction = function(_, direction, relative)
-                    baseMove(LocalPlayer, -direction, relative)
+                local moveFn = rawget(ctrl, "moveFunction") or debug.getproperty(ctrl, "moveFunction")
+                if moveFn then
+                    local orig = MW.origMoveFn
+                    if orig then
+                        pcall(function() ctrl.moveFunction = orig end)
+                    end
                 end
             end)
         end
+    end
+end
+
+local function mwApply(dt)
+    if not alive or not S.Moonwalk.Enabled then
+        if MW.hookOK ~= nil then mwRestore() end
         return
     end
-    if hum.MoveDirection.Magnitude < 0.1 then return end
-    pcall(function() hum.AutoRotate = false end)
-    if S.Moonwalk.Mode == "Rage" then
-        -- spin 180 every other frame: unreadable facing, position untouched
-        S._rageFlip = not S._rageFlip
-        if S._rageFlip then
-            hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(180), 0)
+    local char = LocalPlayer.Character
+    local hum = humOf(char)
+    local hrp = hrpOf(char)
+    if not hum or not hrp or hum.Health <= 0 then return end
+    mwEnsureHook()
+    MW.restored = false
+
+    local mode = S.Moonwalk.Mode
+
+    -- Invert mode: swap forward/back input, keep normal facing logic off
+    if mode == "Invert" then
+        if not MW.inverted then
+            local ctrl = mwGetController()
+            if ctrl then
+                MW.origMoveFn = ctrl.moveFunction
+                MW.inverted = true
+                pcall(function()
+                    ctrl.moveFunction = function(_, direction, relative)
+                        if typeof(direction) == "Vector3" then
+                            direction = -direction
+                        end
+                        MW.origMoveFn(ctrl, direction, relative)
+                    end
+                end)
+            end
         end
-    else -- Legit
+        return
+    elseif MW.inverted then
+        mwRestore()
+        MW.restored = false
+    end
+
+    local moving = hum.MoveDirection.Magnitude > 0.05
+    if not moving then
+        -- idle: let AutoRotate handle nothing; keep current yaw stable
+        MW.lastYaw = nil
+        return
+    end
+
+    pcall(function() hum.AutoRotate = false end)
+
+    -- target yaw: face where the camera looks (Classic) or spin slowly (Spin)
+    local targetYaw
+    if mode == "Spin" then
+        MW.spinAngle = (MW.spinAngle or hrp.Rotation.Y) + dt * 240
+        targetYaw = MW.spinAngle
+    else -- Classic: face camera forward even while moving opposite
         local look = Camera.CFrame.LookVector
-        hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + Vector3.new(look.X, 0, look.Z))
+        targetYaw = math.atan2(look.X, look.Z)
+    end
+
+    -- smooth toward target (prevents snap-fighting with the animator)
+    local k = math.clamp(S.Moonwalk.Smooth * dt, 0, 1)
+    if MW.lastYaw then
+        local d = ((targetYaw - MW.lastYaw + math.pi) % (math.pi * 2)) - math.pi
+        targetYaw = MW.lastYaw + d * k
+    end
+    MW.lastYaw = targetYaw
+
+    -- apply via TwistC0 (neck/torso yaw offset relative to animated facing)
+    local hrpYaw = math.rad(hrp.Rotation.Y)
+    local twist = ((targetYaw - hrpYaw + math.pi) % (math.pi * 2)) - math.pi
+    pcall(function() hum.TwistC0 = CFrame.Angles(0, twist, 0) end)
+end
+
+RunService:BindToRenderStep("VDHubIO_Moonwalk", Enum.RenderPriority.Camera.Value + 1, function(dt)
+    local ok, err = pcall(mwApply, dt)
+    if not ok and not MW.warned then
+        MW.warned = true
+        warn("[VDHub] Moonwalk error: " .. tostring(err))
     end
 end)
 
@@ -876,20 +988,7 @@ RunService.Heartbeat:Connect(function()
         end
     end
     -- (Spider: Tidal raycast loop in PreSimulation below)
-    -- Moonwalk state restore (rotation handled in RenderStepped below for smoothness)
-    if not S.Moonwalk.Enabled and char then
-        if hum.AutoRotate == false then
-            pcall(function() hum.AutoRotate = true end)
-        end
-        if S._reversed then
-            S._reversed = false
-            pcall(function()
-                local pm = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
-                local ctrl = pm:GetControls()
-                ctrl.moveFunction = LocalPlayer.Move
-            end)
-        end
-    end
+    -- Moonwalk restore is handled entirely inside its own RenderStep (mwRestore)
     -- (FastVault: Tidal controller hooks, no run-up teleport)
     -- Auto crouch: fire Crouch remote when killer in radius
     if S.Crouch.Enabled then
@@ -1919,7 +2018,8 @@ c2:Keybind({ Name = "Skillcheck bind", Callback = function() S.Skill.Enabled = n
 local c3 = tCombat:Section({ Side = "Left" })
 c3:Header({ Name = "Moonwalk / Dagger", Icon = "code" })
 c3:Toggle({ Name = "Auto Moonwalk", Default = false, Callback = function(v) S.Moonwalk.Enabled = v end }, "Moonwalk")
-c3:Dropdown({ Name = "Method", Options = {"Legit", "Rage", "Reverse"}, Default = 1, Callback = function(v) S.Moonwalk.Mode = v end }, "MoonwalkMode")
+c3:Dropdown({ Name = "Method", Options = {"Classic", "Invert", "Spin"}, Default = 1, Callback = function(v) S.Moonwalk.Mode = v end }, "MoonwalkMode")
+c3:Slider({ Name = "Turn smooth", Minimum = 4, Maximum = 40, Default = 16, Precision = 0, Callback = function(v) S.Moonwalk.Smooth = v end }, "MoonwalkSmooth")
 c3:Toggle({ Name = "Spin back on dagger", Default = true, Callback = function(v) S.Dagger.SpinBack = v end }, "DaggerSpin")
 -- "Dagger anim speed" slider removed: nothing reads S.Dagger.Speed (dead UI).
 c3:Button({ Name = "Use dagger (spin back)", Icon = "bolt", Callback = function()
@@ -2379,9 +2479,21 @@ aSolo:Slider({ Name = "Orbit distance", Default = 50, Minimum = 0, Maximum = 200
 -- Config tab (per gitbook config)
 tConfig:InsertConfigSection("Left")
 local cs = tConfig:Section({ Side = "Right" })
+cs:Header({ Name = "Keybinds", Icon = "bolt" })
+cs:Button({ Name = "Clear ALL feature binds", Icon = "cross", Callback = function()
+    -- menu open/close key (RightShift on the Window) is NOT touched by design
+    local cleared = 0
+    for _, f in ipairs({ "ParryBind", "SkillBind", "DaggerBind", "UnstickBind", "BreakPalletBind", "HookBind", "NoclipBind", "FlyBind", "FloatUp", "FloatDown" }) do
+        local el = MacLib.Flags[f]
+        if el and el.Unbind then el:Unbind(); cleared = cleared + 1 end
+    end
+    notify("Binds", "cleared " .. cleared .. " feature binds (menu key stays)")
+end })
+
 cs:Header({ Name = "Window", Icon = "sun" })
 cs:Button({ Name = "Unload hub", Icon = "cross", Callback = function()
     alive = false
+    pcall(mwRestore)
     local pt = S._lastRepairPt
     if pt and pt.Parent then pcall(function()
         getRemote("Remotes.Generator.RepairEvent"):FireServer(pt, true)
@@ -2408,6 +2520,7 @@ end })
 
 Window.onUnloaded(function()
     alive = false
+    pcall(mwRestore)
     pcall(clearAllDraw)
     pcall(clearChams)
 end)
@@ -2415,6 +2528,7 @@ tCombat:Select()
 
 getgenv().VDHubIO_Unload = function()
     alive = false
+    pcall(mwRestore)
     pcall(clearAllDraw)
     pcall(clearChams)
     pcall(function() setFly(false) end)
