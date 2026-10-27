@@ -1233,6 +1233,13 @@ local function openPopover(frame)
 	closePopovers()
 	frame.Visible = true
 	table.insert(openPopovers, frame)
+	-- Raise the dismiss layer above every open popover. Previously it sat at ZIndex 29,
+	-- *under* menus (ZIndex 30), so clicks on rows were swallowed and dropdowns looked empty/dead.
+	local topZ = 29
+	for _, q in ipairs(openPopovers) do
+		if q.ZIndex > topZ then topZ = q.ZIndex end
+	end
+	popoverCloser.ZIndex = topZ + 1
 	popoverCloser.Visible = true
 end
 
@@ -3735,8 +3742,6 @@ function MacLib:Window(opts)
 							end
 						end
 					end
-					menu.Size = UDim2.fromOffset(210, math.min(MENU_MAX_H, menuList.AbsoluteSize.Y + 8))
-					clampToScreen(menu)
 					if searchInput then
 						searchInput:GetPropertyChangedSignal("Text"):Connect(rebuild)
 					end
@@ -3749,17 +3754,24 @@ function MacLib:Window(opts)
 						rebuild()
 						local topLeft = chip.AbsolutePosition + Vector2.new(chip.AbsoluteSize.X - 210, chip.AbsoluteSize.Y + 6)
 						menu.Position = UDim2.fromOffset(math.floor(topLeft.X + 0.5), math.floor(topLeft.Y + 0.5))
-						-- bring the current selection into view
-						if not multi then
-							for _, r in ipairs(el._rows) do
-								if r.BackgroundTransparency < 1 then
-									local y = r.AbsolutePosition.Y - menu.AbsolutePosition.Y + menu.CanvasPosition.Y - menu.AbsoluteSize.Y / 2
-									menu.CanvasPosition = Vector2.new(0, math.max(0, y))
-									break
+						-- Fit the frame to its content once Roblox has laid out the fresh rows
+						-- (AbsoluteSize reads are stale/zero in the same frame as rebuild()).
+						task.defer(function()
+							if not menu.Visible then return end
+							local h = math.min(MENU_MAX_H, menuList.AbsoluteSize.Y + 8)
+							if h > 0 then menu.Size = UDim2.fromOffset(210, h) end
+							-- bring the current selection into view
+							if not multi then
+								for _, r in ipairs(el._rows) do
+									if r.BackgroundTransparency < 1 then
+										local y = r.AbsolutePosition.Y - menu.AbsolutePosition.Y + menu.CanvasPosition.Y - menu.AbsoluteSize.Y / 2
+										menu.CanvasPosition = Vector2.new(0, math.max(0, y))
+										break
+									end
 								end
 							end
-						end
-						clampToScreen(menu)
+							clampToScreen(menu)
+						end)
 					end)
 					paint()
 
